@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environment
+.venv/
+env/
+venv/
+
+# Output and temp files
+*.log
+*.tmp

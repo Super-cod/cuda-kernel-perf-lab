@@ -1,0 +1,154 @@
+// Tiled Shared-Memory Matrix Multiplication in PTX Virtual ISA
+// Uses .shared memory blocks and bar.sync barriers to exploit on-chip SRAM,
+// reducing DRAM global memory traffic by a factor of 16x.
+
+.version 6.5
+.target sm_75
+.address_size 64
+
+.visible .entry gemm_tiled_shared(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    // 16x16 tile in on-chip Shared Memory SRAM (256 floats = 1024 bytes each)
+    .shared .align 4 .f32 s_A[256];
+    .shared .align 4 .f32 s_B[256];
+
+    .reg .u32 %r_tidx, %r_tidy, %r_ctidx, %r_ctidy;
+    .reg .u32 %r_row, %r_col, %r_M, %r_N, %r_K;
+    .reg .u32 %r_num_tiles, %r_tile_idx, %r_k;
+    .reg .u64 %ptr_A, %ptr_B, %ptr_C;
+    .reg .u64 %addr_A, %addr_B, %addr_C, %off_64;
+    .reg .u32 %idx_A, %idx_B, %idx_C, %smem_idx, %smem_addr;
+    .reg .u32 %a_col, %b_row;
+    .reg .f32 %val_A, %val_B, %sum;
+    .reg .pred %p_tile_loop, %p_inner_loop, %p_a_valid, %p_b_valid, %p_c_valid;
+
+    // Thread coordinates (16x16 thread block)
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_tidy, %tid.y;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mov.u32 %r_ctidy, %ctaid.y;
+
+    mad.lo.u32 %r_col, %r_ctidx, 16, %r_tidx;
+    mad.lo.u32 %r_row, %r_ctidy, 16, %r_tidy;
+
+    ld.param.u32 %r_M, [param_M];
+    ld.param.u32 %r_N, [param_N];
+    ld.param.u32 %r_K, [param_K];
+
+    ld.param.u64 %ptr_A, [param_A];
+    ld.param.u64 %ptr_B, [param_B];
+    ld.param.u64 %ptr_C, [param_C];
+
+    // s_A and s_B index for this thread: tidy * 16 + tidx
+    mad.lo.u32 %smem_idx, %r_tidy, 16, %r_tidx;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %r_tile_idx, 0;
+
+    // Number of 16-element phases along K dimension: (K + 15) / 16
+    add.u32 %r_num_tiles, %r_K, 15;
+    div.u32 %r_num_tiles, %r_num_tiles, 16;
+
+TILE_LOOP_START:
+    setp.ge.u32 %p_tile_loop, %r_tile_idx, %r_num_tiles;
+    @%p_tile_loop bra TILE_LOOP_END;
+
+    // Cooperative loading of A into s_A:
+    // Thread loads A[row, tile_idx * 16 + tidx]
+    mad.lo.u32 %a_col, %r_tile_idx, 16, %r_tidx;
+    setp.lt.u32 %p_a_valid, %r_row, %r_M;
+    setp.lt.u32 %p_tile_loop, %a_col, %r_K;
+    and.pred %p_a_valid, %p_a_valid, %p_tile_loop;
+
+    @%p_a_valid bra LOAD_A;
+    mov.f32 %val_A, 0.0;
+    bra STORE_SMEM_A;
+
+LOAD_A:
+    mad.lo.u32 %idx_A, %r_row, %r_K, %a_col;
+    mul.wide.u32 %off_64, %idx_A, 4;
+    add.u64 %addr_A, %ptr_A, %off_64;
+    ld.global.f32 %val_A, [%addr_A];
+
+STORE_SMEM_A:
+    mov.u32 %smem_addr, s_A;
+    mad.lo.u32 %smem_addr, %smem_idx, 4, %smem_addr;
+    st.shared.f32 [%smem_addr], %val_A;
+
+    // Cooperative loading of B into s_B:
+    // Thread loads B[tile_idx * 16 + tidy, col]
+    mad.lo.u32 %b_row, %r_tile_idx, 16, %r_tidy;
+    setp.lt.u32 %p_b_valid, %b_row, %r_K;
+    setp.lt.u32 %p_tile_loop, %r_col, %r_N;
+    and.pred %p_b_valid, %p_b_valid, %p_tile_loop;
+
+    @%p_b_valid bra LOAD_B;
+    mov.f32 %val_B, 0.0;
+    bra STORE_SMEM_B;
+
+LOAD_B:
+    mad.lo.u32 %idx_B, %b_row, %r_N, %r_col;
+    mul.wide.u32 %off_64, %idx_B, 4;
+    add.u64 %addr_B, %ptr_B, %off_64;
+    ld.global.f32 %val_B, [%addr_B];
+
+STORE_SMEM_B:
+    mov.u32 %smem_addr, s_B;
+    mad.lo.u32 %smem_addr, %smem_idx, 4, %smem_addr;
+    st.shared.f32 [%smem_addr], %val_B;
+
+    // Barrier: Wait until all 256 threads finished loading tiles into Shared Memory
+    bar.sync 0;
+
+    // Multiply tile elements in fast SRAM
+    mov.u32 %r_k, 0;
+INNER_LOOP_START:
+    setp.ge.u32 %p_inner_loop, %r_k, 16;
+    @%p_inner_loop bra INNER_LOOP_END;
+
+    // Load s_A[tidy, k]
+    mad.lo.u32 %idx_A, %r_tidy, 16, %r_k;
+    mov.u32 %smem_addr, s_A;
+    mad.lo.u32 %smem_addr, %idx_A, 4, %smem_addr;
+    ld.shared.f32 %val_A, [%smem_addr];
+
+    // Load s_B[k, tidx]
+    mad.lo.u32 %idx_B, %r_k, 16, %r_tidx;
+    mov.u32 %smem_addr, s_B;
+    mad.lo.u32 %smem_addr, %idx_B, 4, %smem_addr;
+    ld.shared.f32 %val_B, [%smem_addr];
+
+    fma.rn.f32 %sum, %val_A, %val_B, %sum;
+
+    add.u32 %r_k, %r_k, 1;
+    bra INNER_LOOP_START;
+
+INNER_LOOP_END:
+    // Barrier: Ensure all threads finished computing before overwriting s_A and s_B in next tile
+    bar.sync 0;
+
+    add.u32 %r_tile_idx, %r_tile_idx, 1;
+    bra TILE_LOOP_START;
+
+TILE_LOOP_END:
+    // Store result if within bounds of C
+    setp.lt.u32 %p_c_valid, %r_row, %r_M;
+    setp.lt.u32 %p_tile_loop, %r_col, %r_N;
+    and.pred %p_c_valid, %p_c_valid, %p_tile_loop;
+    @!%p_c_valid bra EXIT;
+
+    mad.lo.u32 %idx_C, %r_row, %r_N, %r_col;
+    mul.wide.u32 %off_64, %idx_C, 4;
+    add.u64 %addr_C, %ptr_C, %off_64;
+    st.global.f32 [%addr_C], %sum;
+
+EXIT:
+    ret;
+}

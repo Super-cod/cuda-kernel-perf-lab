@@ -1,0 +1,85 @@
+// Naive Global Memory Matrix Multiplication in PTX Virtual ISA
+// Performs C = A * B where A is (M x K), B is (K x N), C is (M x N)
+// Every inner loop step issues two global memory DRAM fetches
+
+.version 6.5
+.target sm_75
+.address_size 64
+
+.visible .entry gemm_naive(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u32 %r_tidx, %r_tidy, %r_ntidx, %r_ntidy, %r_ctidx, %r_ctidy;
+    .reg .u32 %r_row, %r_col, %r_M, %r_N, %r_K, %r_k;
+    .reg .u64 %ptr_A, %ptr_B, %ptr_C;
+    .reg .u64 %addr_A, %addr_B, %addr_C, %offset_A, %offset_B, %offset_C;
+    .reg .u32 %idx_A, %idx_B, %idx_C;
+    .reg .f32 %val_A, %val_B, %sum;
+    .reg .pred %p_bounds, %p_loop;
+
+    // Thread coordinates
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_tidy, %tid.y;
+    mov.u32 %r_ntidx, %ntid.x;
+    mov.u32 %r_ntidy, %ntid.y;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mov.u32 %r_ctidy, %ctaid.y;
+
+    mad.lo.u32 %r_col, %r_ctidx, %r_ntidx, %r_tidx;
+    mad.lo.u32 %r_row, %r_ctidy, %r_ntidy, %r_tidy;
+
+    ld.param.u32 %r_M, [param_M];
+    ld.param.u32 %r_N, [param_N];
+    ld.param.u32 %r_K, [param_K];
+
+    // Bounds check
+    setp.ge.u32 %p_bounds, %r_row, %r_M;
+    @%p_bounds bra EXIT;
+    setp.ge.u32 %p_bounds, %r_col, %r_N;
+    @%p_bounds bra EXIT;
+
+    ld.param.u64 %ptr_A, [param_A];
+    ld.param.u64 %ptr_B, [param_B];
+    ld.param.u64 %ptr_C, [param_C];
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %r_k, 0;
+
+LOOP_START:
+    setp.ge.u32 %p_loop, %r_k, %r_K;
+    @%p_loop bra LOOP_END;
+
+    // Address of A[row, k] = ptr_A + (row * K + k) * 4
+    mad.lo.u32 %idx_A, %r_row, %r_K, %r_k;
+    mul.wide.u32 %offset_A, %idx_A, 4;
+    add.u64 %addr_A, %ptr_A, %offset_A;
+    ld.global.f32 %val_A, [%addr_A];
+
+    // Address of B[k, col] = ptr_B + (k * N + col) * 4
+    mad.lo.u32 %idx_B, %r_k, %r_N, %r_col;
+    mul.wide.u32 %offset_B, %idx_B, 4;
+    add.u64 %addr_B, %ptr_B, %offset_B;
+    ld.global.f32 %val_B, [%addr_B];
+
+    // FMA accumulation
+    fma.rn.f32 %sum, %val_A, %val_B, %sum;
+
+    add.u32 %r_k, %r_k, 1;
+    bra LOOP_START;
+
+LOOP_END:
+    // Store C[row, col] = ptr_C + (row * N + col) * 4
+    mad.lo.u32 %idx_C, %r_row, %r_N, %r_col;
+    mul.wide.u32 %offset_C, %idx_C, 4;
+    add.u64 %addr_C, %ptr_C, %offset_C;
+    st.global.f32 [%addr_C], %sum;
+
+EXIT:
+    ret;
+}

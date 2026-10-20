@@ -1,0 +1,127 @@
+// Warp Divergence & Predicated Execution in PTX Virtual ISA
+// Demonstrates warp-level execution serialization on intra-warp branching
+// vs warp-uniform execution vs predicated arithmetic instructions
+
+.version 6.5
+.target sm_75
+.address_size 64
+
+// 1. Divergent Warp Branch: Even vs Odd threads in the same warp take different branches
+.visible .entry warp_divergent(
+    .param .u64 param_data,
+    .param .u32 param_n,
+    .param .u32 param_iters
+)
+{
+    .reg .u32 %r_tidx, %r_ntidx, %r_ctidx, %r_idx, %r_n, %r_iters, %r_i, %r_mod;
+    .reg .u64 %ptr_data, %addr_data, %off;
+    .reg .f32 %val;
+    .reg .pred %p_bounds, %p_diverge, %p_loop;
+
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_ntidx, %ntid.x;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mad.lo.u32 %r_idx, %r_ctidx, %r_ntidx, %r_tidx;
+
+    ld.param.u32 %r_n, [param_n];
+    setp.ge.u32 %p_bounds, %r_idx, %r_n;
+    @%p_bounds bra EXIT;
+
+    ld.param.u64 %ptr_data, [param_data];
+    ld.param.u32 %r_iters, [param_iters];
+
+    mul.wide.u32 %off, %r_idx, 4;
+    add.u64 %addr_data, %ptr_data, %off;
+    ld.global.f32 %val, [%addr_data];
+
+    // Check intra-warp thread divergence: threadIdx.x % 2
+    rem.u32 %r_mod, %r_tidx, 2;
+    setp.eq.u32 %p_diverge, %r_mod, 0;
+
+    // The warp splits: Even threads execute PATH_A while odd threads stall
+    @%p_diverge bra PATH_EVEN;
+
+PATH_ODD:
+    mov.u32 %r_i, 0;
+LOOP_ODD:
+    setp.ge.u32 %p_loop, %r_i, %r_iters;
+    @%p_loop bra DONE;
+    fma.rn.f32 %val, %val, 1.0001, 0.5;
+    add.u32 %r_i, %r_i, 1;
+    bra LOOP_ODD;
+
+PATH_EVEN:
+    mov.u32 %r_i, 0;
+LOOP_EVEN:
+    setp.ge.u32 %p_loop, %r_i, %r_iters;
+    @%p_loop bra DONE;
+    fma.rn.f32 %val, %val, 0.9999, 0.25;
+    add.u32 %r_i, %r_i, 1;
+    bra LOOP_EVEN;
+
+DONE:
+    st.global.f32 [%addr_data], %val;
+
+EXIT:
+    ret;
+}
+
+// 2. Uniform Warp Execution: All 32 threads in the warp take the identical path
+.visible .entry warp_uniform(
+    .param .u64 param_data,
+    .param .u32 param_n,
+    .param .u32 param_iters
+)
+{
+    .reg .u32 %r_tidx, %r_ntidx, %r_ctidx, %r_idx, %r_n, %r_iters, %r_i, %r_warp_id, %r_mod;
+    .reg .u64 %ptr_data, %addr_data, %off;
+    .reg .f32 %val;
+    .reg .pred %p_bounds, %p_uniform, %p_loop;
+
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_ntidx, %ntid.x;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mad.lo.u32 %r_idx, %r_ctidx, %r_ntidx, %r_tidx;
+
+    ld.param.u32 %r_n, [param_n];
+    setp.ge.u32 %p_bounds, %r_idx, %r_n;
+    @%p_bounds bra EXIT;
+
+    ld.param.u64 %ptr_data, [param_data];
+    ld.param.u32 %r_iters, [param_iters];
+
+    mul.wide.u32 %off, %r_idx, 4;
+    add.u64 %addr_data, %ptr_data, %off;
+    ld.global.f32 %val, [%addr_data];
+
+    // Warp-level branching: all 32 threads have identical (threadIdx.x / 32)
+    div.u32 %r_warp_id, %r_tidx, 32;
+    rem.u32 %r_mod, %r_warp_id, 2;
+    setp.eq.u32 %p_uniform, %r_mod, 0;
+
+    @%p_uniform bra PATH_EVEN;
+
+PATH_ODD:
+    mov.u32 %r_i, 0;
+LOOP_ODD:
+    setp.ge.u32 %p_loop, %r_i, %r_iters;
+    @%p_loop bra DONE;
+    fma.rn.f32 %val, %val, 1.0001, 0.5;
+    add.u32 %r_i, %r_i, 1;
+    bra LOOP_ODD;
+
+PATH_EVEN:
+    mov.u32 %r_i, 0;
+LOOP_EVEN:
+    setp.ge.u32 %p_loop, %r_i, %r_iters;
+    @%p_loop bra DONE;
+    fma.rn.f32 %val, %val, 0.9999, 0.25;
+    add.u32 %r_i, %r_i, 1;
+    bra LOOP_EVEN;
+
+DONE:
+    st.global.f32 [%addr_data], %val;
+
+EXIT:
+    ret;
+}

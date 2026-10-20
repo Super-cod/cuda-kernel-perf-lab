@@ -1,0 +1,117 @@
+// Memory Coalescing & Vectorized 128-bit Transfer Kernels in PTX Virtual ISA
+// Demonstrates hardware memory transaction coalescing vs strided thrashing vs 128-bit bus saturation
+
+.version 6.5
+.target sm_75
+.address_size 64
+
+// 1. Fully Coalesced Memory Copy (Adjacent threads access contiguous 4-byte words)
+.visible .entry copy_coalesced(
+    .param .u64 param_in,
+    .param .u64 param_out,
+    .param .u32 param_n
+)
+{
+    .reg .u32 %r_tidx, %r_ntidx, %r_ctidx, %r_idx, %r_n;
+    .reg .u64 %ptr_in, %ptr_out, %addr_in, %addr_out, %off;
+    .reg .f32 %val;
+    .reg .pred %p;
+
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_ntidx, %ntid.x;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mad.lo.u32 %r_idx, %r_ctidx, %r_ntidx, %r_tidx;
+
+    ld.param.u32 %r_n, [param_n];
+    setp.ge.u32 %p, %r_idx, %r_n;
+    @%p bra EXIT;
+
+    ld.param.u64 %ptr_in, [param_in];
+    ld.param.u64 %ptr_out, [param_out];
+
+    mul.wide.u32 %off, %r_idx, 4;
+    add.u64 %addr_in, %ptr_in, %off;
+    add.u64 %addr_out, %ptr_out, %off;
+
+    ld.global.f32 %val, [%addr_in];
+    st.global.f32 [%addr_out], %val;
+
+EXIT:
+    ret;
+}
+
+// 2. Strided Memory Copy (Each thread accesses every S-th element, breaking coalescing)
+.visible .entry copy_strided(
+    .param .u64 param_in,
+    .param .u64 param_out,
+    .param .u32 param_n,
+    .param .u32 param_stride
+)
+{
+    .reg .u32 %r_tidx, %r_ntidx, %r_ctidx, %r_idx, %r_n, %r_stride, %r_strided_idx;
+    .reg .u64 %ptr_in, %ptr_out, %addr_in, %addr_out, %off;
+    .reg .f32 %val;
+    .reg .pred %p;
+
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_ntidx, %ntid.x;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mad.lo.u32 %r_idx, %r_ctidx, %r_ntidx, %r_tidx;
+
+    ld.param.u32 %r_n, [param_n];
+    setp.ge.u32 %p, %r_idx, %r_n;
+    @%p bra EXIT;
+
+    ld.param.u32 %r_stride, [param_stride];
+    mul.lo.u32 %r_strided_idx, %r_idx, %r_stride;
+    rem.u32 %r_strided_idx, %r_strided_idx, %r_n;
+
+    ld.param.u64 %ptr_in, [param_in];
+    ld.param.u64 %ptr_out, [param_out];
+
+    mul.wide.u32 %off, %r_strided_idx, 4;
+    add.u64 %addr_in, %ptr_in, %off;
+    add.u64 %addr_out, %ptr_out, %off;
+
+    ld.global.f32 %val, [%addr_in];
+    st.global.f32 [%addr_out], %val;
+
+EXIT:
+    ret;
+}
+
+// 3. Vectorized 128-bit Memory Copy (Each thread processes 4 floats via ld.global.v4.f32)
+.visible .entry copy_vectorized_v4(
+    .param .u64 param_in,
+    .param .u64 param_out,
+    .param .u32 param_n_vec
+)
+{
+    .reg .u32 %r_tidx, %r_ntidx, %r_ctidx, %r_idx, %r_n_vec;
+    .reg .u64 %ptr_in, %ptr_out, %addr_in, %addr_out, %off;
+    .reg .f32 %v0, %v1, %v2, %v3;
+    .reg .pred %p;
+
+    mov.u32 %r_tidx, %tid.x;
+    mov.u32 %r_ntidx, %ntid.x;
+    mov.u32 %r_ctidx, %ctaid.x;
+    mad.lo.u32 %r_idx, %r_ctidx, %r_ntidx, %r_tidx;
+
+    ld.param.u32 %r_n_vec, [param_n_vec];
+    setp.ge.u32 %p, %r_idx, %r_n_vec;
+    @%p bra EXIT;
+
+    ld.param.u64 %ptr_in, [param_in];
+    ld.param.u64 %ptr_out, [param_out];
+
+    // 16 bytes per vector of 4 floats
+    mul.wide.u32 %off, %r_idx, 16;
+    add.u64 %addr_in, %ptr_in, %off;
+    add.u64 %addr_out, %ptr_out, %off;
+
+    ld.global.v4.f32 {%v0, %v1, %v2, %v3}, [%addr_in];
+    st.global.v4.f32 [%addr_out], {%v0, %v1, %v2, %v3};
+
+EXIT:
+    ret;
+}
